@@ -17,7 +17,10 @@ OpsTimer — Windows용 운영자급 타이머 / 스톱워치
 - 항상 위, 미니 모드(드래그 가능한 작은 플로팅 창), F11 전체화면(발표용)
 - 창 크기에 맞춰 숫자 크기 자동 조절, 작업표시줄 제목에 남은 시간 표시
 - 스톱워치: 1/100초, 랩 기록(최고/최저 랩 색상 표시), CSV 내보내기
-- 모든 타이머 실행 결과를 %APPDATA%\\OpsTimer\\history.csv 에 기록
+- 작업명 입력 (최근 작업명 드롭다운), 진행 중 작업명 표시
+- 모든 타이머 실행 결과(작업명·설정·실제 경과)를 %APPDATA%\\OpsTimer\\history.csv 에 기록
+- 기록 더블클릭으로 작업명 수정, 선택 삭제
+- 옵시디언 내보내기: 요약·작업별 합계·세션 목록 마크다운 생성 후 옵시디언에서 열기
 - 설정 자동 저장 (%APPDATA%\\OpsTimer\\settings.json)
 - 명령줄 실행: python ops_timer.py 25m [--mini]
 
@@ -37,8 +40,9 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
+from urllib.parse import quote
 
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
@@ -47,7 +51,7 @@ if IS_WIN:
     from ctypes import wintypes
 
 APP_NAME = "OpsTimer"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -63,7 +67,12 @@ DEFAULT_SETTINGS = {
     "beep_freq": 1000,
     "alarm_max_sec": 60,
     "geometry": "",
+    "recent_titles": [],
+    "obsidian_dir": "",
 }
+
+HIST_HEADER = ["start", "end", "title", "planned", "actual", "result"]
+TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 # 색상
 BG = "#111418"
@@ -249,6 +258,90 @@ def preset_label(p: str) -> str:
     return f"{sec}초"
 
 
+def elapsed_str(start: str, end: str) -> str:
+    try:
+        a = dt.datetime.strptime(start, TS_FMT)
+        b = dt.datetime.strptime(end, TS_FMT)
+    except ValueError:
+        return ""
+    return hms(max(0, int((b - a).total_seconds())))
+
+
+def hms_to_sec(s: str) -> int:
+    try:
+        return int(parse_duration(s)) if s else 0
+    except ValueError:
+        return 0
+
+
+def build_markdown(rows, d0, d1) -> str:
+    """기록 행 목록 → 옵시디언용 마크다운 (frontmatter + 요약 + 작업별 합계 + 세션 목록)."""
+    def esc(s):
+        return (s or "").replace("|", "\\|").replace("\n", " ").strip()
+
+    n = len(rows)
+    done = sum(1 for r in rows if r[5] == "완료")
+    stopped = sum(1 for r in rows if r[5] == "중단")
+    total = sum(hms_to_sec(r[4]) for r in rows)
+    focus = sum(hms_to_sec(r[4]) for r in rows if r[5] == "완료")
+    by_title = {}
+    for r in rows:
+        key = esc(r[2]) or "(제목 없음)"
+        cnt, sec = by_title.get(key, (0, 0))
+        by_title[key] = (cnt + 1, sec + hms_to_sec(r[4]))
+
+    single_day = d0 == d1
+    period = d0 if single_day else f"{d0} ~ {d1}"
+    now = dt.datetime.now()
+
+    L = ["---", "type: timer-log", f"date: {d0}"]
+    if not single_day:
+        L.append(f"date_end: {d1}")
+    L += [
+        f"sessions: {n}",
+        f"completed: {done}",
+        f"interrupted: {stopped}",
+        f'total_time: "{hms(total)}"',
+        "tags:",
+        "  - timer-log",
+        f"created: {now:%Y-%m-%dT%H:%M}",
+        "---",
+        "",
+        f"# ⏱️ 타이머 기록 {period}",
+        "",
+        "## 요약",
+        "",
+        "| 항목 | 값 |",
+        "|---|---|",
+        f"| 총 세션 | {n}회 |",
+        f"| 완료 | {done}회 |",
+        f"| 중단 | {stopped}회 |",
+        f"| 총 경과 시간 | {hms(total)} |",
+        f"| 완료 세션 시간 | {hms(focus)} |",
+        "",
+        "## 작업별 합계",
+        "",
+        "| 작업 | 횟수 | 경과 시간 |",
+        "|---|---:|---:|",
+    ]
+    for title, (cnt, sec) in sorted(by_title.items(), key=lambda kv: -kv[1][1]):
+        L.append(f"| {title} | {cnt} | {hms(sec)} |")
+    L += [
+        "",
+        "## 세션 목록",
+        "",
+        "| # | 시작 | 종료 | 작업 | 설정 | 경과 | 결과 |",
+        "|---:|---|---|---|---:|---:|---|",
+    ]
+    icon = {"완료": "✅ 완료", "중단": "⏹️ 중단"}
+    for i, r in enumerate(rows, 1):
+        start = r[0][11:16] if single_day else r[0][:16]
+        end = r[1][11:16] if single_day else r[1][:16]
+        L.append(f"| {i} | {start} | {end} | {esc(r[2]) or '—'} | {r[3]} | {r[4]} | {icon.get(r[5], r[5])} |")
+    L += ["", "## 메모", "", "- ", "", f"> OpsTimer에서 {now:%Y-%m-%d %H:%M}에 내보냄", ""]
+    return "\n".join(L)
+
+
 def load_settings() -> dict:
     s = dict(DEFAULT_SETTINGS)
     try:
@@ -295,6 +388,8 @@ class OpsTimer(tk.Tk):
         self.t_started_wall = None
         self.t_end_wall = None
         self.t_cycles = 0
+        self.t_title = ""
+        self.hist_rows = {}  # 기록 트리 iid → [start, end, title, planned, actual, result]
 
         # 스톱워치 상태
         self.sw_running = False
@@ -412,6 +507,14 @@ class OpsTimer(tk.Tk):
         self.pb = ttk.Progressbar(f, maximum=1000)
         self.pb.pack(fill="x", pady=(8, 6))
 
+        trow = ttk.Frame(f)
+        trow.pack(fill="x", pady=2)
+        ttk.Label(trow, text="작업").pack(side="left")
+        self.cmb_title = ttk.Combobox(trow, values=self.settings.get("recent_titles", []), font=("Segoe UI", 11))
+        self.cmb_title.pack(side="left", fill="x", expand=True, padx=6)
+        self.cmb_title.bind("<Return>", lambda e: (self._title_enter(), "break")[1])
+        ttk.Label(trow, text="(선택) 기록에 남을 작업명", foreground=MUTED).pack(side="left", padx=4)
+
         row = ttk.Frame(f)
         row.pack(fill="x", pady=2)
         ttk.Label(row, text="시간").pack(side="left")
@@ -474,24 +577,31 @@ class OpsTimer(tk.Tk):
 
     def _build_hist_tab(self):
         f = self.tab_hist
-        cols = ("start", "end", "planned", "result")
+        cols = ("start", "end", "title", "planned", "actual", "result")
         tf = ttk.Frame(f)
         tf.pack(fill="both", expand=True)
         self.tree_h = ttk.Treeview(tf, columns=cols, show="headings", takefocus=False)
-        for c, t, w in zip(cols, ("시작", "종료", "설정 시간", "결과"), (160, 160, 100, 80)):
+        spec = (("시작", 158, "center"), ("종료", 72, "center"), ("작업", 140, "w"),
+                ("설정", 65, "center"), ("경과", 65, "center"), ("결과", 55, "center"))
+        for c, (t, w, a) in zip(cols, spec):
             self.tree_h.heading(c, text=t)
-            self.tree_h.column(c, width=w, anchor="center")
+            self.tree_h.column(c, width=w, anchor=a, stretch=(c == "title"))
         self.tree_h.tag_configure("중단", foreground="#C62828")
+        self.tree_h.bind("<Double-Button-1>", self.hist_edit_title)
+        self.tree_h.bind("<Delete>", lambda e: self.hist_delete_selected())
         sb = ttk.Scrollbar(tf, orient="vertical", command=self.tree_h.yview)
         self.tree_h.configure(yscrollcommand=sb.set)
         self.tree_h.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
+        ttk.Label(f, text="더블클릭: 작업명 수정 · 행을 선택하면 선택한 기록만, 선택이 없으면 전체를 내보냅니다",
+                  foreground=MUTED).pack(fill="x", pady=(4, 0))
         ctl = ttk.Frame(f)
-        ctl.pack(fill="x", pady=(6, 0))
-        self._btn(ctl, "폴더 열기", self.open_data_dir).pack(side="left")
-        self._btn(ctl, "기록 지우기", self.clear_history).pack(side="left", padx=6)
-        ttk.Label(ctl, text=HISTORY_PATH, foreground=MUTED).pack(side="right")
+        ctl.pack(fill="x", pady=(4, 0))
+        self._btn(ctl, "📝 옵시디언으로 내보내기", self.export_obsidian, style="Big.TButton").pack(side="left")
+        self._btn(ctl, "선택 삭제", self.hist_delete_selected).pack(side="left", padx=(8, 0))
+        self._btn(ctl, "기록 지우기", self.clear_history).pack(side="left", padx=4)
+        self._btn(ctl, "폴더 열기", self.open_data_dir).pack(side="right")
 
     # ── 단축키 ───────────────────────────────────────────────
     def _hot(self, func):
@@ -582,6 +692,9 @@ class OpsTimer(tk.Tk):
         if self.t_state == "running" and self.t_deadline - time.perf_counter() <= 0:
             self._timer_finished()
         text, color, status, prog, eta = self._timer_view()
+        if self.t_title and self.t_state != "idle":
+            short = self.t_title if len(self.t_title) <= 28 else self.t_title[:27] + "…"
+            status = f"{short} · {status}"
         self._set(self.lbl_t, "t", text=text, fg=color)
         self._set(self.lbl_t_state, "ts", text=status, fg=ALERT if self.t_state == "overtime" else MUTED)
         self._set(self.lbl_t_eta, "te", text=eta)
@@ -603,7 +716,8 @@ class OpsTimer(tk.Tk):
 
     def _update_title(self):
         if self.t_state != "idle":
-            title = f"{self._timer_view()[0]} · {APP_NAME}"
+            mid = f" · {self.t_title}" if self.t_title else ""
+            title = f"{self._timer_view()[0]}{mid} · {APP_NAME}"
         elif self.sw_running:
             title = f"{self._sw_text()} · {APP_NAME}"
         else:
@@ -644,6 +758,8 @@ class OpsTimer(tk.Tk):
             self.t_deadline = now + self.t_total
             self.t_started_wall = dt.datetime.now()
             self.t_cycles = 0
+            self.t_title = self.cmb_title.get().strip()
+            self._remember_title(self.t_title)
             self.t_state = "running"
             self.focus_set()
         elif st == "running":
@@ -656,6 +772,24 @@ class OpsTimer(tk.Tk):
             self.timer_ack()
             return
         self._update_controls()
+
+    def _title_enter(self):
+        """작업명 칸에서 Enter: 대기 중이면 시작, 진행 중이면 현재 작업명만 변경."""
+        if self.t_state == "idle":
+            self.timer_start_new()
+        else:
+            self.t_title = self.cmb_title.get().strip()
+            self._remember_title(self.t_title)
+            self.focus_set()
+
+    def _remember_title(self, title):
+        if not title:
+            return
+        recent = [t for t in self.settings.get("recent_titles", []) if t != title]
+        recent.insert(0, title)
+        self.settings["recent_titles"] = recent[:15]
+        self.cmb_title.configure(values=self.settings["recent_titles"])
+        save_settings(self.settings)
 
     def timer_start_new(self):
         if self.t_state != "idle":
@@ -746,6 +880,9 @@ class OpsTimer(tk.Tk):
         w.resizable(False, False)
         w.attributes("-topmost", True)
         tk.Label(w, text="⏰  시간 종료", font=("Segoe UI", 24, "bold"), bg="#2A0F12", fg=ALERT).pack(padx=40, pady=(22, 4))
+        if self.t_title:
+            tk.Label(w, text=self.t_title, font=("Segoe UI", 14, "bold"), bg="#2A0F12", fg=FG,
+                     wraplength=420).pack(padx=20, pady=(0, 4))
         tk.Label(w, text=f"설정 {hms(math.ceil(self.t_total))} · {self.t_end_wall:%H:%M:%S} 종료",
                  font=("Segoe UI", 11), bg="#2A0F12", fg=FG).pack()
         self.lbl_alarm_over = tk.Label(w, text="초과 00:00", font=("Consolas", 18, "bold"), bg="#2A0F12", fg=FG)
@@ -864,31 +1001,143 @@ class OpsTimer(tk.Tk):
             messagebox.showerror(APP_NAME, f"저장 실패: {e}", parent=self)
 
     # ── 기록 ─────────────────────────────────────────────────
+    def _hist_values(self, row):
+        # 종료는 같은 날이면 시:분:초만 표시
+        end = row[1][11:] if row[1][:10] == row[0][:10] else row[1]
+        return (row[0], end, row[2] or "—", row[3], row[4], row[5])
+
+    def _hist_add(self, row):
+        iid = self.tree_h.insert("", 0, values=self._hist_values(row), tags=(row[5],))
+        self.hist_rows[iid] = row
+        return iid
+
+    def _hist_rows_chrono(self, iids=None):
+        """화면은 최신순, 파일·내보내기는 시간순."""
+        iids = list(iids) if iids else list(self.tree_h.get_children())
+        rows = [self.hist_rows[i] for i in iids if i in self.hist_rows]
+        return sorted(rows, key=lambda r: r[0])
+
+    def _hist_save_all(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = HISTORY_PATH + ".tmp"
+            with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(HIST_HEADER)
+                w.writerows(self._hist_rows_chrono())
+            os.replace(tmp, HISTORY_PATH)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"기록 저장 실패: {e}", parent=self)
+
     def _log(self, result):
         start = self.t_started_wall or dt.datetime.now()
         end = dt.datetime.now()
-        row = [f"{start:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}", hms(math.ceil(self.t_total)), result]
+        s, e = f"{start:{TS_FMT}}", f"{end:{TS_FMT}}"
+        row = [s, e, self.t_title, hms(math.ceil(self.t_total)), elapsed_str(s, e), result]
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             new = not os.path.exists(HISTORY_PATH)
             with open(HISTORY_PATH, "a", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 if new:
-                    w.writerow(["start", "end", "planned", "result"])
+                    w.writerow(HIST_HEADER)
                 w.writerow(row)
         except OSError:
             pass
-        self.tree_h.insert("", 0, values=row, tags=(result,))
+        self._hist_add(row)
 
     def _load_history(self):
         try:
             with open(HISTORY_PATH, newline="", encoding="utf-8-sig") as f:
-                rows = list(csv.reader(f))[1:]
+                rows = list(csv.reader(f))
         except OSError:
             return
-        for row in rows[-500:]:
-            if len(row) == 4:
-                self.tree_h.insert("", 0, values=row, tags=(row[3],))
+        if not rows:
+            return
+        header, data = rows[0], rows[1:]
+        migrate = header != HIST_HEADER
+        for r in data:
+            if len(r) == 4:  # 이전 버전 형식: start, end, planned, result
+                r = [r[0], r[1], "", r[2], elapsed_str(r[0], r[1]), r[3]]
+            if len(r) == 6:
+                self._hist_add(r)
+        if migrate:  # 이전 형식 파일은 백업 후 새 형식으로 변환
+            try:
+                import shutil
+                shutil.copy2(HISTORY_PATH, os.path.join(DATA_DIR, "history_v1_backup.csv"))
+            except OSError:
+                pass
+            self._hist_save_all()
+
+    def hist_edit_title(self, event=None):
+        iid = self.tree_h.identify_row(event.y) if event is not None else ""
+        if not iid:
+            sel = self.tree_h.selection()
+            iid = sel[0] if sel else ""
+        if not iid or iid not in self.hist_rows:
+            return
+        row = self.hist_rows[iid]
+        new = simpledialog.askstring(APP_NAME, f"{row[0]} 기록의 작업명:", initialvalue=row[2], parent=self)
+        if new is None:
+            return
+        row[2] = new.strip()
+        self.tree_h.item(iid, values=self._hist_values(row))
+        self._hist_save_all()
+        self._remember_title(row[2])
+
+    def hist_delete_selected(self):
+        sel = [i for i in self.tree_h.selection() if i in self.hist_rows]
+        if not sel:
+            messagebox.showinfo(APP_NAME, "삭제할 기록을 먼저 선택하세요.", parent=self)
+            return
+        if not messagebox.askyesno(APP_NAME, f"선택한 기록 {len(sel)}개를 삭제할까요?", parent=self):
+            return
+        for iid in sel:
+            self.tree_h.delete(iid)
+            self.hist_rows.pop(iid, None)
+        self._hist_save_all()
+
+    def export_obsidian(self):
+        sel = self.tree_h.selection()
+        rows = self._hist_rows_chrono(sel)
+        if not rows:
+            messagebox.showinfo(APP_NAME, "내보낼 기록이 없습니다.", parent=self)
+            return
+        scope = f"선택한 기록 {len(rows)}개" if sel else f"전체 기록 {len(rows)}개"
+        folder = filedialog.askdirectory(
+            parent=self, mustexist=True,
+            title=f"{scope}를 저장할 폴더를 선택하세요 (옵시디언 보관함 안의 폴더)",
+            initialdir=self.settings.get("obsidian_dir") or os.path.expanduser("~"))
+        if not folder:
+            return
+        self.settings["obsidian_dir"] = folder
+        save_settings(self.settings)
+
+        d0, d1 = rows[0][0][:10], rows[-1][0][:10]
+        name = f"타이머 기록 {d0}.md" if d0 == d1 else f"타이머 기록 {d0} ~ {d1}.md"
+        path = os.path.normpath(os.path.join(folder, name))
+        if os.path.exists(path) and not messagebox.askyesno(
+                APP_NAME, f"이미 같은 이름의 파일이 있습니다.\n{name}\n\n덮어쓸까요?", parent=self):
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(build_markdown(rows, d0, d1))
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"저장 실패: {e}", parent=self)
+            return
+        if messagebox.askyesno(APP_NAME, f"{scope}를 저장했습니다.\n{path}\n\n옵시디언에서 열까요?", parent=self):
+            self._open_in_obsidian(path)
+
+    def _open_in_obsidian(self, path):
+        uri = "obsidian://open?path=" + quote(path.replace("\\", "/"), safe="")
+        try:
+            if IS_WIN:
+                os.startfile(uri)
+            else:
+                import webbrowser
+                webbrowser.open(uri)
+        except OSError:
+            messagebox.showinfo(APP_NAME, "옵시디언을 열 수 없습니다. 파일은 정상적으로 저장되었습니다.", parent=self)
 
     def open_data_dir(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -909,6 +1158,7 @@ class OpsTimer(tk.Tk):
         except OSError:
             pass
         self.tree_h.delete(*self.tree_h.get_children())
+        self.hist_rows.clear()
 
     # ── 창 모드 ──────────────────────────────────────────────
     def _on_option(self):
